@@ -323,6 +323,20 @@ def _latex_to_omml_paragraph(latex_text, doc):
         run.font.italic = True
         return p, False
 
+    # Post-process: fix rad elements for square root display
+    for rad in omath.iter(f'{{{ns_m}}}rad'):
+        existing_children = list(rad)
+        for child in existing_children:
+            rad.remove(child)
+
+        radPr = etree.SubElement(rad, f'{{{ns_m}}}radPr')
+        degHide = etree.SubElement(radPr, f'{{{ns_m}}}degHide')
+        degHide.set(f'{{{ns_m}}}val', '1')
+        deg = etree.SubElement(rad, f'{{{ns_m}}}deg')
+        for child in existing_children:
+            if child.tag != f'{{{ns_m}}}radPr':
+                rad.append(child)
+
     # Start with a fresh paragraph from python-docx so it's tracked properly
     p = doc.add_paragraph()
     # Remove default run and inject OMML elements into the paragraph element
@@ -369,9 +383,25 @@ def _latex_to_omml_element(latex_text):
 
     try:
         parser = etree.XMLParser(remove_blank_text=True)
-        return etree.fromstring(omml_xml, parser)
+        omath = etree.fromstring(omml_xml, parser)
     except Exception:
         return None
+
+    # Post-process: fix rad elements for square root display
+    for rad in omath.iter(f'{{{ns_m}}}rad'):
+        existing_children = list(rad)
+        for child in existing_children:
+            rad.remove(child)
+
+        radPr = etree.SubElement(rad, f'{{{ns_m}}}radPr')
+        degHide = etree.SubElement(radPr, f'{{{ns_m}}}degHide')
+        degHide.set(f'{{{ns_m}}}val', '1')
+        deg = etree.SubElement(rad, f'{{{ns_m}}}deg')
+        for child in existing_children:
+            if child.tag != f'{{{ns_m}}}radPr':
+                rad.append(child)
+
+    return omath
 
 
 def parse_md_to_docx(md_path, docx_path):
