@@ -509,6 +509,96 @@ def _add_footer(doc):
     run5._element.append(parse_xml(f'<w:fldChar {nsdecls("w")} w:fldCharType="end"/>'))
 
 
+def _build_style_heading_map(raw_bytes):
+    heading_map = {}
+    try:
+        root = etree.fromstring(raw_bytes)
+    except Exception:
+        return heading_map
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    for style_el in root.iter(f"{{{ns}}}style"):
+        style_id = style_el.get(f"{{{ns}}}styleId")
+        name_el = style_el.find(f"{{{ns}}}name")
+        if name_el is None:
+            continue
+        name_val = name_el.get(f"{{{ns}}}val", "")
+        outline_el = style_el.find(f"{{{ns}}}pPr/{ns}outlineLvl" if False else f"{{{ns}}}pPr/{{{ns}}}outlineLvl")
+        if outline_el is not None:
+            level = outline_el.get(f"{{{ns}}}val")
+            if level is not None:
+                heading_map[style_id] = int(level) + 1
+                continue
+        lower_name = name_val.lower()
+        for prefix in ("heading ", "заголовок "):
+            if lower_name.startswith(prefix):
+                try:
+                    level = int(lower_name[len(prefix):])
+                    if 1 <= level <= 9:
+                        heading_map[style_id] = level
+                except ValueError:
+                    pass
+    return heading_map
+
+
+def _build_numbering_map(raw_bytes):
+    num_fmt_map = {}
+    try:
+        root = etree.fromstring(raw_bytes)
+    except Exception:
+        return num_fmt_map
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+    abstract_fmts = {}
+    for abs_num in root.iter(f"{{{ns}}}abstractNum"):
+        abs_id = abs_num.get(f"{{{ns}}}abstractNumId")
+        if abs_id is None:
+            continue
+        levels = {}
+        for lvl in abs_num.iter(f"{{{ns}}}lvl"):
+            ilvl = lvl.get(f"{{{ns}}}ilvl")
+            num_fmt_el = lvl.find(f"{{{ns}}}numFmt")
+            if num_fmt_el is not None:
+                levels[int(ilvl)] = num_fmt_el.get(f"{{{ns}}}val", "decimal")
+        abstract_fmts[abs_id] = levels
+
+    for num in root.iter(f"{{{ns}}}num"):
+        num_id = num.get(f"{{{ns}}}numId")
+        if num_id is None:
+            continue
+        abs_num_ref = num.find(f"{{{ns}}}abstractNumId")
+        if abs_num_ref is None:
+            continue
+        abs_id = abs_num_ref.get(f"{{{ns}}}val")
+        if abs_id in abstract_fmts:
+            num_fmt_map[num_id] = abstract_fmts[abs_id]
+    return num_fmt_map
+
+
+def _build_list_style_map(raw_bytes, num_fmt_map):
+    list_style_map = {}
+    try:
+        root = etree.fromstring(raw_bytes)
+    except Exception:
+        return list_style_map
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    for style_el in root.iter(f"{{{ns}}}style"):
+        style_id = style_el.get(f"{{{ns}}}styleId")
+        num_pr = style_el.find(f"{{{ns}}}pPr/{{{ns}}}numPr")
+        if num_pr is None:
+            continue
+        num_id_el = num_pr.find(f"{{{ns}}}numId")
+        ilvl_el = num_pr.find(f"{{{ns}}}ilvl")
+        if num_id_el is None:
+            continue
+        num_id = num_id_el.get(f"{{{ns}}}val")
+        ilvl = ilvl_el.get(f"{{{ns}}}val") if ilvl_el is not None else "0"
+        fmt = "decimal"
+        if num_id in num_fmt_map and int(ilvl) in num_fmt_map[num_id]:
+            fmt = num_fmt_map[num_id][int(ilvl)]
+        list_style_map[style_id] = (num_id, int(ilvl), fmt)
+    return list_style_map
+
+
 def parse_docx_to_md(docx_path, md_path):
     raise NotImplementedError("DOCX → MD not yet implemented")
 
