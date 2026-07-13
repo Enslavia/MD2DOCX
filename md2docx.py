@@ -939,8 +939,136 @@ def _apply_replacements(docx_path):
 
 
 def _inject_comments(buf, out_path, comments):
-    with open(out_path, "wb") as f:
-        f.write(buf.getvalue())
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    ct_ns = "http://schemas.openxmlformats.org/package/2006/content-types"
+    rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+    with zipfile.ZipFile(buf, "r") as z:
+        data = {n: z.read(n) for n in z.namelist()}
+
+    doc_root = etree.fromstring(data["word/document.xml"])
+    body = doc_root.find(f"{{{ns}}}body")
+
+    # Map para_idx to body child element index
+    child_elements = list(body)
+    para_to_child = {}
+    child_idx = -1
+    for ci, child in enumerate(child_elements):
+        if child.tag == f"{{{ns}}}p":
+            child_idx += 1
+            para_to_child[child_idx] = ci
+        elif child.tag == f"{{{ns}}}tbl":
+            child_idx += 1
+            para_to_child[child_idx] = ci
+
+    # Parse existing comments.xml or create new
+    comments_root = None
+    next_id = 0
+    if "word/comments.xml" in data:
+        try:
+            comments_root = etree.fromstring(data["word/comments.xml"])
+            existing_ids = []
+            for c in comments_root.iter(f"{{{ns}}}comment"):
+                cid = c.get(f"{{{ns}}}id")
+                if cid is not None:
+                    existing_ids.append(int(cid))
+            if existing_ids:
+                next_id = max(existing_ids) + 1
+        except Exception:
+            comments_root = None
+
+    if comments_root is None:
+        comments_root = etree.fromstring(
+            f'<w:comments xmlns:w="{ns}"></w:comments>'
+        )
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    for para_idx, author, text in comments:
+        if para_idx not in para_to_child:
+            continue
+        ci = para_to_child[para_idx]
+        target_elem = child_elements[ci]
+        # Ensure target is a paragraph
+        if target_elem.tag != f"{{{ns}}}p":
+            continue
+
+        cid = str(next_id)
+        next_id += 1
+
+        # Create comment element
+        comm = etree.SubElement(comments_root, f"{{{ns}}}comment")
+        comm.set(f"{{{ns}}}id", cid)
+        comm.set(f"{{{ns}}}author", author)
+        comm.set(f"{{{ns}}}date", now_utc)
+        cp = etree.SubElement(comm, f"{{{ns}}}p")
+        cr = etree.SubElement(cp, f"{{{ns}}}r")
+        ct = etree.SubElement(cr, f"{{{ns}}}t")
+        ct.text = text
+
+        # Get or create pPr
+        pPr = target_elem.find(f"{{{ns}}}pPr")
+        if pPr is None:
+            pPr = etree.Element(f"{{{ns}}}pPr")
+            target_elem.insert(0, pPr)
+
+        # Insert commentRangeStart after pPr
+        cs = etree.Element(f"{{{ns}}}commentRangeStart")
+        cs.set(f"{{{ns}}}id", cid)
+        pPr.addnext(cs)
+
+        # Add commentRangeEnd and commentReference at the end
+        ce = etree.Element(f"{{{ns}}}commentRangeEnd")
+        ce.set(f"{{{ns}}}id", cid)
+        target_elem.append(ce)
+
+        ref_r = etree.SubElement(target_elem, f"{{{ns}}}r")
+        ref_rPr = etree.SubElement(ref_r, f"{{{ns}}}rPr")
+        ref_rStyle = etree.SubElement(ref_rPr, f"{{{ns}}}rStyle")
+        ref_rStyle.set(f"{{{ns}}}val", "CommentReference")
+        ref_cr = etree.SubElement(ref_r, f"{{{ns}}}commentReference")
+        ref_cr.set(f"{{{ns}}}id", cid)
+
+    data["word/document.xml"] = etree.tostring(doc_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    data["word/comments.xml"] = etree.tostring(comments_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+    # Update [Content_Types].xml
+    ct_root = etree.fromstring(data["[Content_Types].xml"])
+    has_comment_ct = False
+    for child in ct_root:
+        if child.get("PartName") == "/word/comments.xml":
+            has_comment_ct = True
+            break
+    if not has_comment_ct:
+        override = etree.SubElement(ct_root, f"{{{ct_ns}}}Override")
+        override.set("PartName", "/word/comments.xml")
+        override.set("ContentType", "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml")
+        data["[Content_Types].xml"] = etree.tostring(ct_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+    # Update word/_rels/document.xml.rels
+    rels_root = etree.fromstring(data["word/_rels/document.xml.rels"])
+    has_comment_rel = False
+    max_rel_id = 0
+    for child in rels_root:
+        rid = child.get("Id", "")
+        if rid.startswith("rId"):
+            try:
+                max_rel_id = max(max_rel_id, int(rid[3:]))
+            except ValueError:
+                pass
+        if child.get("Target") == "comments.xml":
+            has_comment_rel = True
+            break
+    if not has_comment_rel:
+        rel = etree.SubElement(rels_root, f"{{{rel_ns}}}Relationship")
+        rel.set("Id", f"rId{max_rel_id + 1}")
+        rel.set("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments")
+        rel.set("Target", "comments.xml")
+        data["word/_rels/document.xml.rels"] = etree.tostring(rels_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+    with zipfile.ZipFile(out_path, "w") as zout:
+        for name, content in data.items():
+            zout.writestr(name, content)
 
 
 def _inject_numbering(docx_path):
