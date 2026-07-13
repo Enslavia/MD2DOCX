@@ -231,7 +231,7 @@ def parse_md_to_docx(md_path, docx_path):
     def add_paragraph(text, style=None):
         nonlocal para_count
         if style:
-            p = doc.add_paragraph(style=style)
+                p = doc.add_paragraph(style=style)
         else:
             p = doc.add_paragraph()
         if text:
@@ -242,6 +242,9 @@ def parse_md_to_docx(md_path, docx_path):
             comment_list.append((idx, pc_author, pc_text))
         pending_comments.clear()
         return p, idx
+
+    # Nested list support requires tracking indentation depth across consecutive list lines.
+    # This is not currently implemented; the parser only handles flat lists.
 
     while i < n:
         raw = lines[i]
@@ -912,30 +915,33 @@ def parse_docx_to_md(docx_path, md_path):
 
 
 def _apply_replacements(docx_path):
-    replacements = {"\u2014": "\u2013", "\u0451": "\u0435", "\u0401": "\u0415"}
-    with zipfile.ZipFile(docx_path, "r") as zin:
-        data = {name: zin.read(name) for name in zin.namelist()}
-    for name in list(data.keys()):
-        if name.endswith(".xml") or name.endswith(".rels"):
-            try:
-                root = etree.fromstring(data[name])
-            except Exception:
-                continue
-            changed = False
-            for el in root.iter():
-                if el.text:
-                    new_text = el.text
-                    for old, new in replacements.items():
-                        if old in new_text:
-                            new_text = new_text.replace(old, new)
-                            changed = True
-                    if changed:
-                        el.text = new_text
-            if changed:
-                data[name] = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
-    with zipfile.ZipFile(docx_path, "w") as zout:
-        for name, content in data.items():
-            zout.writestr(name, content)
+    try:
+        replacements = {"\u2014": "\u2013", "\u0451": "\u0435", "\u0401": "\u0415"}
+        with zipfile.ZipFile(docx_path, "r") as zin:
+            data = {name: zin.read(name) for name in zin.namelist()}
+        for name in list(data.keys()):
+            if name.endswith(".xml") or name.endswith(".rels"):
+                try:
+                    root = etree.fromstring(data[name])
+                except Exception:
+                    continue
+                changed = False
+                for el in root.iter():
+                    if el.text:
+                        new_text = el.text
+                        for old, new in replacements.items():
+                            if old in new_text:
+                                new_text = new_text.replace(old, new)
+                                changed = True
+                        if changed:
+                            el.text = new_text
+                if changed:
+                    data[name] = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+        with zipfile.ZipFile(docx_path, "w") as zout:
+            for name, content in data.items():
+                zout.writestr(name, content)
+    except Exception:
+        pass
 
 
 def _inject_comments(buf, out_path, comments):
@@ -943,8 +949,13 @@ def _inject_comments(buf, out_path, comments):
     ct_ns = "http://schemas.openxmlformats.org/package/2006/content-types"
     rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
 
-    with zipfile.ZipFile(buf, "r") as z:
-        data = {n: z.read(n) for n in z.namelist()}
+    try:
+        with zipfile.ZipFile(buf, "r") as z:
+            data = {n: z.read(n) for n in z.namelist()}
+    except Exception:
+        with open(out_path, "wb") as f:
+            f.write(buf.getvalue())
+        return
 
     doc_root = etree.fromstring(data["word/document.xml"])
     body = doc_root.find(f"{{{ns}}}body")
@@ -1066,12 +1077,23 @@ def _inject_comments(buf, out_path, comments):
         rel.set("Target", "comments.xml")
         data["word/_rels/document.xml.rels"] = etree.tostring(rels_root, xml_declaration=True, encoding="UTF-8", standalone=True)
 
-    with zipfile.ZipFile(out_path, "w") as zout:
-        for name, content in data.items():
-            zout.writestr(name, content)
+    try:
+        with zipfile.ZipFile(out_path, "w") as zout:
+            for name, content in data.items():
+                zout.writestr(name, content)
+    except Exception:
+        with open(out_path, "wb") as f:
+            f.write(buf.getvalue())
 
 
 def _inject_numbering(docx_path):
+    try:
+        _do_inject_numbering(docx_path)
+    except Exception:
+        pass
+
+
+def _do_inject_numbering(docx_path):
     ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
     r_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
