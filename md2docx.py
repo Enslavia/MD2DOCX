@@ -514,7 +514,30 @@ def parse_docx_to_md(docx_path, md_path):
 
 
 def _apply_replacements(docx_path):
-    pass
+    replacements = {"\u2014": "\u2013", "\u0451": "\u0435", "\u0401": "\u0415"}
+    with zipfile.ZipFile(docx_path, "r") as zin:
+        data = {name: zin.read(name) for name in zin.namelist()}
+    for name in list(data.keys()):
+        if name.endswith(".xml") or name.endswith(".rels"):
+            try:
+                root = etree.fromstring(data[name])
+            except Exception:
+                continue
+            changed = False
+            for el in root.iter():
+                if el.text:
+                    new_text = el.text
+                    for old, new in replacements.items():
+                        if old in new_text:
+                            new_text = new_text.replace(old, new)
+                            changed = True
+                    if changed:
+                        el.text = new_text
+            if changed:
+                data[name] = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    with zipfile.ZipFile(docx_path, "w") as zout:
+        for name, content in data.items():
+            zout.writestr(name, content)
 
 
 def _inject_comments(buf, out_path, comments):
