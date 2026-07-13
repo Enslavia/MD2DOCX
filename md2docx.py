@@ -226,6 +226,8 @@ def parse_md_to_docx(md_path, docx_path):
     para_count = 0
     title_done = False
 
+    comment_list = []
+
     def add_paragraph(text, style=None):
         nonlocal para_count
         if style:
@@ -237,7 +239,7 @@ def parse_md_to_docx(md_path, docx_path):
         idx = para_count
         para_count += 1
         for pc_author, pc_text in pending_comments:
-            pass
+            comment_list.append((idx, pc_author, pc_text))
         pending_comments.clear()
         return p, idx
 
@@ -267,6 +269,9 @@ def parse_md_to_docx(md_path, docx_path):
                 p = doc.add_paragraph(style=f"Heading {eff_level}")
                 _add_inline_formatting(p, text)
                 para_count += 1
+            for pc_author, pc_text in pending_comments:
+                comment_list.append((para_count - 1, pc_author, pc_text))
+            pending_comments.clear()
             i += 1
             continue
 
@@ -283,6 +288,9 @@ def parse_md_to_docx(md_path, docx_path):
                 p = doc.add_paragraph(style="List Bullet")
                 _add_inline_formatting(p, bline)
                 para_count += 1
+                for pc_author, pc_text in pending_comments:
+                    comment_list.append((para_count - 1, pc_author, pc_text))
+                pending_comments.clear()
             continue
 
         if NUMBERED_RE.match(line):
@@ -298,6 +306,9 @@ def parse_md_to_docx(md_path, docx_path):
                 p = doc.add_paragraph(style="List Number")
                 _add_inline_formatting(p, nline)
                 para_count += 1
+                for pc_author, pc_text in pending_comments:
+                    comment_list.append((para_count - 1, pc_author, pc_text))
+                pending_comments.clear()
             continue
 
         if CODE_FENCE_RE.match(line):
@@ -314,6 +325,9 @@ def parse_md_to_docx(md_path, docx_path):
                 run.font.name = "Courier New"
                 run.font.size = Pt(9)
                 para_count += 1
+                for pc_author, pc_text in pending_comments:
+                    comment_list.append((para_count - 1, pc_author, pc_text))
+                pending_comments.clear()
             continue
 
         if BLOCKQUOTE_RE.match(line):
@@ -334,6 +348,9 @@ def parse_md_to_docx(md_path, docx_path):
                     run.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
                 p.paragraph_format.left_indent = Inches(0.5)
                 para_count += 1
+                for pc_author, pc_text in pending_comments:
+                    comment_list.append((para_count - 1, pc_author, pc_text))
+                pending_comments.clear()
             continue
 
         if TABLE_RE.match(line) and line.count("|") >= 3:
@@ -391,6 +408,9 @@ def parse_md_to_docx(md_path, docx_path):
                         tblHeader = parse_xml(f'<w:tblHeader {nsdecls("w")}/>')
                         trPr.append(tblHeader)
                 para_count += 1
+                for pc_author, pc_text in pending_comments:
+                    comment_list.append((para_count - 1, pc_author, pc_text))
+                pending_comments.clear()
             continue
 
         if HR_RE.match(line):
@@ -411,6 +431,9 @@ def parse_md_to_docx(md_path, docx_path):
             )
             pPr.append(pBdr)
             para_count += 1
+            for pc_author, pc_text in pending_comments:
+                comment_list.append((para_count - 1, pc_author, pc_text))
+            pending_comments.clear()
             i += 1
             continue
 
@@ -439,8 +462,15 @@ def parse_md_to_docx(md_path, docx_path):
 
     buf = io.BytesIO()
     doc.save(buf)
-    with open(docx_path, "wb") as f:
-        f.write(buf.getvalue())
+
+    if comment_list:
+        _inject_comments(buf, docx_path, comment_list)
+    else:
+        with open(docx_path, "wb") as f:
+            f.write(buf.getvalue())
+
+    _apply_replacements(docx_path)
+    _inject_numbering(docx_path)
 
 
 def _add_footer(doc):
@@ -488,7 +518,8 @@ def _apply_replacements(docx_path):
 
 
 def _inject_comments(buf, out_path, comments):
-    pass
+    with open(out_path, "wb") as f:
+        f.write(buf.getvalue())
 
 
 def _inject_numbering(docx_path):
