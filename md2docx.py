@@ -599,8 +599,316 @@ def _build_list_style_map(raw_bytes, num_fmt_map):
     return list_style_map
 
 
+def _run_to_span(r_elem):
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    text_parts = []
+    for child in r_elem.iter():
+        tag = child.tag
+        if tag == f"{{{ns}}}t":
+            text_parts.append(child.text or "")
+        elif tag == f"{{{ns}}}tab":
+            text_parts.append("\t")
+        elif tag == f"{{{ns}}}br":
+            text_parts.append("\n")
+    text = "".join(text_parts)
+
+    rPr = r_elem.find(f"{{{ns}}}rPr")
+    bold = italic = strike = code = False
+    if rPr is not None:
+        b_elem = rPr.find(f"{{{ns}}}b")
+        if b_elem is not None:
+            val = b_elem.get(f"{{{ns}}}val", "true")
+            bold = val.lower() not in ("0", "false", "off")
+        i_elem = rPr.find(f"{{{ns}}}i")
+        if i_elem is not None:
+            val = i_elem.get(f"{{{ns}}}val", "true")
+            italic = val.lower() not in ("0", "false", "off")
+        strike = rPr.find(f"{{{ns}}}strike") is not None
+        rFonts = rPr.find(f"{{{ns}}}rFonts")
+        if rFonts is not None:
+            ascii_font = rFonts.get(f"{{{ns}}}ascii")
+            if ascii_font and "Courier" in ascii_font:
+                code = True
+
+    return text, bold, italic, strike, code
+
+
+def _merge_spans(spans):
+    if not spans:
+        return []
+    merged = [spans[0]]
+    for span in spans[1:]:
+        prev = merged[-1]
+        if (prev[1] == span[1] and prev[2] == span[2] and
+                prev[3] == span[3] and prev[4] == span[4]):
+            merged[-1] = (prev[0] + span[0], prev[1], prev[2], prev[3], prev[4])
+        else:
+            merged.append(span)
+    return merged
+
+
+def _extract_inline_md(p_elem):
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    spans = []
+    for r in p_elem.iter(f"{{{ns}}}r"):
+        span = _run_to_span(r)
+        if span[0]:
+            spans.append(span)
+    spans = _merge_spans(spans)
+
+    parts = []
+    for text, bold, italic, strike, code in spans:
+        text = text.replace("**", "\\*\\*").replace("*", "\\*")
+        text = text.replace("~", "\\~")
+        if code:
+            parts.append(f"`{text}`")
+        elif bold and italic:
+            parts.append(f"***{text}***")
+        elif bold:
+            parts.append(f"**{text}**")
+        elif italic:
+            parts.append(f"*{text}*")
+        elif strike:
+            parts.append(f"~~{text}~~")
+        else:
+            parts.append(text)
+
+    return "".join(parts)
+
+
+def _extract_plain_text(p_elem):
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    parts = []
+    for r in p_elem.iter(f"{{{ns}}}r"):
+        for t in r.iter(f"{{{ns}}}t"):
+            if t.text:
+                parts.append(t.text)
+        for tab in r.iter(f"{{{ns}}}tab"):
+            parts.append("\t")
+        for br in r.iter(f"{{{ns}}}br"):
+            parts.append("\n")
+    return "".join(parts)
+
+
+def _table_to_md(tbl_elem):
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    rows = []
+    for tr in tbl_elem.iter(f"{{{ns}}}tr"):
+        cells = []
+        for tc in tr.iter(f"{{{ns}}}tc"):
+            cell_text = ""
+            for p in tc.iter(f"{{{ns}}}p"):
+                cell_text += _extract_plain_text(p) + " "
+            cells.append(cell_text.strip().replace("|", "\\|"))
+        rows.append(cells)
+    if not rows:
+        return ""
+    num_cols = max(len(r) for r in rows)
+    lines = []
+    lines.append("| " + " | ".join(rows[0][c] if c < len(rows[0]) else "" for c in range(num_cols)) + " |")
+    lines.append("|" + "---|" * num_cols)
+    for row in rows[1:]:
+        lines.append("| " + " | ".join(row[c] if c < len(row) else "" for c in range(num_cols)) + " |")
+    return "\n".join(lines)
+
+
+def _paragraph_to_md(p_elem, heading_map, num_fmt_map, list_map, comments_map):
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    pPr = p_elem.find(f"{{{ns}}}pPr")
+
+    style_id = None
+    if pPr is not None:
+        pStyle = pPr.find(f"{{{ns}}}pStyle")
+        if pStyle is not None:
+            style_id = pStyle.get(f"{{{ns}}}val")
+
+    # Check for code block (Courier New font on ALL runs, or Code Block style)
+    is_code = False
+    if style_id == "CodeBlock" or style_id == "Code":
+        is_code = True
+    else:
+        code_runs = []
+        total_runs = 0
+        for r in p_elem.iter(f"{{{ns}}}r"):
+            _, _, _, _, code = _run_to_span(r)
+            t, _, _, _, _ = _run_to_span(r)
+            if t.strip():
+                total_runs += 1
+                if code:
+                    code_runs.append(True)
+        if total_runs > 0 and len(code_runs) == total_runs:
+            is_code = True
+
+    # Check for numberPr (list item)
+    num_id = None
+    ilvl = 0
+    num_fmt = None
+    if pPr is not None:
+        numPr = pPr.find(f"{{{ns}}}numPr")
+        if numPr is not None:
+            num_id_el = numPr.find(f"{{{ns}}}numId")
+            if num_id_el is not None:
+                num_id = num_id_el.get(f"{{{ns}}}val")
+            ilvl_el = numPr.find(f"{{{ns}}}ilvl")
+            if ilvl_el is not None:
+                ilvl = int(ilvl_el.get(f"{{{ns}}}val", "0"))
+            if num_id and num_id in num_fmt_map and ilvl in num_fmt_map[num_id]:
+                num_fmt = num_fmt_map[num_id][ilvl]
+
+    # Check style-based list info
+    if num_id is None and style_id and style_id in list_map:
+        sid, silvl, sfmt = list_map[style_id]
+        num_id = sid
+        ilvl = silvl
+        num_fmt = sfmt
+
+    # Check heading
+    heading_level = None
+    if style_id and style_id in heading_map:
+        hl = heading_map[style_id]
+        if 1 <= hl <= 6:
+            heading_level = hl
+
+    if heading_level is not None:
+        text = _extract_inline_md(p_elem)
+        text = re.sub(r"\*{1,3}", "", text)
+        text = re.sub(r"`([^`]+)`", r"\1", text)
+        return "#" * heading_level + " " + text + "\n", False
+
+    if is_code:
+        lines = []
+        for r in p_elem.iter(f"{{{ns}}}r"):
+            t, _, _, _, _ = _run_to_span(r)
+            if t:
+                lines.append(t)
+        text = "\n".join(lines).rstrip("\n")
+        return "```\n" + text + "\n```\n", False
+
+    if num_fmt == "bullet":
+        text = _extract_inline_md(p_elem)
+        return "- " + text + "\n", False
+
+    if num_fmt in ("decimal", "lowerLetter", "upperLetter", "lowerRoman", "upperRoman"):
+        text = _extract_inline_md(p_elem)
+        return "1. " + text + "\n", False
+
+    text = _extract_inline_md(p_elem)
+    if text.strip() == "":
+        return "\n", False
+    return text + "\n", False
+
+
+def _load_comments(raw_bytes):
+    comments = {}
+    try:
+        root = etree.fromstring(raw_bytes)
+    except Exception:
+        return comments
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    for comm in root.iter(f"{{{ns}}}comment"):
+        cid = comm.get(f"{{{ns}}}id")
+        author = comm.get(f"{{{ns}}}author", "")
+        date = comm.get(f"{{{ns}}}date", "")
+        text_parts = []
+        for t in comm.iter(f"{{{ns}}}t"):
+            if t.text:
+                text_parts.append(t.text)
+        comments[cid] = {"author": author, "date": date, "text": "".join(text_parts)}
+    return comments
+
+
+def _build_comment_ranges(root):
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    body = root.find(f"{{{ns}}}body")
+    if body is None:
+        return {}
+    comment_indices = {}
+    para_idx = -1
+    for child in body.iter():
+        if child.tag == f"{{{ns}}}p":
+            para_idx += 1
+        if child.tag == f"{{{ns}}}commentRangeStart":
+            cid = child.get(f"{{{ns}}}id")
+            if cid:
+                if para_idx not in comment_indices:
+                    comment_indices[para_idx] = []
+                comment_indices[para_idx].append(cid)
+    return comment_indices
+
+
+def _docx_to_markdown(docx_path):
+    with open(docx_path, "rb") as f:
+        raw_bytes = f.read()
+
+    with zipfile.ZipFile(io.BytesIO(raw_bytes), "r") as z:
+        names = z.namelist()
+        doc_xml = z.read("word/document.xml")
+        styles_xml = z.read("word/styles.xml") if "word/styles.xml" in names else b""
+        num_xml = z.read("word/numbering.xml") if "word/numbering.xml" in names else b""
+        comments_xml = z.read("word/comments.xml") if "word/comments.xml" in names else b""
+
+    heading_map = _build_style_heading_map(styles_xml)
+    num_fmt_map = _build_numbering_map(num_xml)
+    list_map = _build_list_style_map(styles_xml, num_fmt_map)
+    comment_data = _load_comments(comments_xml)
+
+    root = etree.fromstring(doc_xml)
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    body = root.find(f"{{{ns}}}body")
+
+    comment_ranges = _build_comment_ranges(root)
+    para_idx = -1
+    output_lines = []
+
+    # Process body children, handling tables
+    for child in body:
+        if child.tag == f"{{{ns}}}tbl":
+            md = _table_to_md(child) + "\n"
+            if md.strip():
+                output_lines.append(md)
+            continue
+
+        if child.tag != f"{{{ns}}}p":
+            continue
+
+        pPr = child.find(f"{{{ns}}}pPr")
+        # Skip empty paragraphs that are just structure
+        has_text = False
+        for r in child.iter(f"{{{ns}}}r"):
+            for t in r.iter(f"{{{ns}}}t"):
+                if t.text and t.text.strip():
+                    has_text = True
+                    break
+        if not has_text:
+            # Check if it's a list item or heading with no text
+            style_id = None
+            if pPr is not None:
+                pStyle = pPr.find(f"{{{ns}}}pStyle")
+                if pStyle is not None:
+                    style_id = pStyle.get(f"{{{ns}}}val")
+            if not style_id:
+                continue
+
+        para_idx += 1
+        md, is_table = _paragraph_to_md(child, heading_map, num_fmt_map, list_map, comment_data)
+        output_lines.append(md)
+
+        if para_idx in comment_ranges:
+            for cid in comment_ranges[para_idx]:
+                if cid in comment_data:
+                    c = comment_data[cid]
+                    output_lines.append(f"<!-- COMMENT [{c['author']}]: {c['text']} -->\n")
+
+    result = "".join(output_lines)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    result = result.rstrip("\n") + "\n"
+    return result
+
+
 def parse_docx_to_md(docx_path, md_path):
-    raise NotImplementedError("DOCX → MD not yet implemented")
+    result = _docx_to_markdown(docx_path)
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(result)
 
 
 def _apply_replacements(docx_path):
