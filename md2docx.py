@@ -57,8 +57,216 @@ INLINE_CODE_RE = re.compile(r"`([^`]+)`")
 INLINE_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 
 
+def _clear_theme_fonts(style):
+    rPr = style.element.find(qn("w:rPr"))
+    if rPr is None:
+        rPr = parse_xml(f'<w:rPr {nsdecls("w")}></w:rPr>')
+        style.element.append(rPr)
+    rFonts = rPr.find(qn("w:rFonts"))
+    if rFonts is None:
+        rFonts = parse_xml(f'<w:rFonts {nsdecls("w")}></w:rFonts>')
+        rPr.insert(0, rFonts)
+    for attr in ["asciiTheme", "hAnsiTheme", "cstheme", "eastAsiaTheme"]:
+        try:
+            del rFonts.attrib[qn(f"w:{attr}")]
+        except KeyError:
+            pass
+
+
+def _set_run_font(run, name="Times New Roman", size=11, bold=False, italic=False, color=None, underline=False):
+    run.font.name = name
+    run.font.size = Pt(size)
+    run.font.bold = bold
+    run.font.italic = italic
+    run.font.underline = underline
+    if color:
+        run.font.color.rgb = color
+    rPr = run._element.find(qn("w:rPr"))
+    if rPr is not None:
+        rFonts = rPr.find(qn("w:rFonts"))
+        if rFonts is not None:
+            for attr in ["asciiTheme", "hAnsiTheme", "cstheme", "eastAsiaTheme"]:
+                try:
+                    del rFonts.attrib[qn(f"w:{attr}")]
+                except KeyError:
+                    pass
+
+
+def _add_inline_formatting(paragraph, text):
+    tokens = []
+    pos = 0
+    while pos < len(text):
+        m = INLINE_BOLD_ITALIC_RE.search(text, pos)
+        bi_m = INLINE_BOLD_RE.search(text, pos)
+        i_m = INLINE_ITALIC_RE.search(text, pos)
+        c_m = INLINE_CODE_RE.search(text, pos)
+        l_m = INLINE_LINK_RE.search(text, pos)
+        matches = []
+        if m:
+            matches.append((m.start(), "bold_italic", m))
+        if bi_m:
+            matches.append((bi_m.start(), "bold", bi_m))
+        if i_m:
+            matches.append((i_m.start(), "italic", i_m))
+        if c_m:
+            matches.append((c_m.start(), "code", c_m))
+        if l_m:
+            matches.append((l_m.start(), "link", l_m))
+
+        matches = [m for m in matches if m[0] >= pos]
+        if not matches:
+            tokens.append(("text", text[pos:]))
+            break
+
+        matches.sort(key=lambda x: x[0])
+        best = matches[0]
+
+        if best[0] > pos:
+            tokens.append(("text", text[pos:best[0]]))
+
+        _, kind, match = best
+        if kind == "bold_italic":
+            tokens.append(("bold_italic", match.group(1)))
+            pos = match.end()
+        elif kind == "bold":
+            tokens.append(("bold", match.group(1)))
+            pos = match.end()
+        elif kind == "italic":
+            tokens.append(("italic", match.group(1)))
+            pos = match.end()
+        elif kind == "code":
+            tokens.append(("code", match.group(1)))
+            pos = match.end()
+        elif kind == "link":
+            tokens.append(("link", match.group(1), match.group(2)))
+            pos = match.end()
+    for token in tokens:
+        if token[0] == "text":
+            run = paragraph.add_run(token[1])
+            _set_run_font(run)
+        elif token[0] == "bold_italic":
+            run = paragraph.add_run(token[1])
+            _set_run_font(run, bold=True, italic=True)
+        elif token[0] == "bold":
+            run = paragraph.add_run(token[1])
+            _set_run_font(run, bold=True)
+        elif token[0] == "italic":
+            run = paragraph.add_run(token[1])
+            _set_run_font(run, italic=True)
+        elif token[0] == "code":
+            run = paragraph.add_run(token[1])
+            _set_run_font(run, name="Courier New", size=10)
+        elif token[0] == "link":
+            run = paragraph.add_run(token[1])
+            _set_run_font(run, color=RGBColor(0x05, 0x63, 0xC1), underline=True)
+
+
+def _configure_document(doc):
+    style = doc.styles["Normal"]
+    style.font.name = "Times New Roman"
+    style.font.size = Pt(11)
+    pf = style.paragraph_format
+    pf.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+    _clear_theme_fonts(style)
+
+
 def parse_md_to_docx(md_path, docx_path):
-    raise NotImplementedError("MD → DOCX not yet implemented")
+    with open(md_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    doc = Document()
+    _configure_document(doc)
+
+    i = 0
+    n = len(lines)
+    pending_comments = []
+    para_count = 0
+
+    def add_paragraph(text, style=None):
+        nonlocal para_count
+        if style:
+            p = doc.add_paragraph(style=style)
+        else:
+            p = doc.add_paragraph()
+        if text:
+            _add_inline_formatting(p, text)
+        idx = para_count
+        para_count += 1
+        for pc_author, pc_text in pending_comments:
+            pass
+        pending_comments.clear()
+        return p, idx
+
+    while i < n:
+        raw = lines[i]
+        line = raw.rstrip("\n").rstrip("\r")
+        cm = COMMENT_RE.match(line)
+        if cm:
+            pending_comments.append((cm.group(1), cm.group(2)))
+            i += 1
+            continue
+
+        if HEADING_RE.match(line):
+            i += 1
+            continue
+
+        if BULLET_RE.match(line):
+            i += 1
+            continue
+
+        if NUMBERED_RE.match(line):
+            i += 1
+            continue
+
+        if CODE_FENCE_RE.match(line):
+            i += 1
+            while i < n and not CODE_FENCE_RE.match(lines[i]):
+                i += 1
+            i += 1
+            continue
+
+        if BLOCKQUOTE_RE.match(line):
+            i += 1
+            continue
+
+        if TABLE_RE.match(line) and line.count("|") >= 3:
+            i += 1
+            continue
+
+        if HR_RE.match(line):
+            if i + 1 < n:
+                next_line = lines[i + 1].strip()
+                if HEADING_RE.match(next_line):
+                    i += 1
+                    continue
+            i += 1
+            continue
+
+        if line.strip() == "":
+            i += 1
+            continue
+
+        plain_lines = []
+        while i < n:
+            l = lines[i].rstrip("\n").rstrip("\r")
+            if l.strip() == "":
+                break
+            if (HEADING_RE.match(l) or BULLET_RE.match(l) or NUMBERED_RE.match(l)
+                    or CODE_FENCE_RE.match(l) or BLOCKQUOTE_RE.match(l)
+                    or (TABLE_RE.match(l) and l.count("|") >= 3)
+                    or HR_RE.match(l) or COMMENT_RE.match(l)):
+                break
+            plain_lines.append(l)
+            i += 1
+
+        if plain_lines:
+            text = " ".join(plain_lines)
+            add_paragraph(text)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    with open(docx_path, "wb") as f:
+        f.write(buf.getvalue())
 
 
 def parse_docx_to_md(docx_path, md_path):
