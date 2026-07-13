@@ -271,15 +271,49 @@ def parse_md_to_docx(md_path, docx_path):
             continue
 
         if BULLET_RE.match(line):
-            i += 1
+            bullet_lines = []
+            while i < n:
+                l = lines[i].rstrip("\n").rstrip("\r")
+                bm = BULLET_RE.match(l)
+                if not bm:
+                    break
+                bullet_lines.append(bm.group(2))
+                i += 1
+            for bline in bullet_lines:
+                p = doc.add_paragraph(style="List Bullet")
+                _add_inline_formatting(p, bline)
+                para_count += 1
             continue
 
         if NUMBERED_RE.match(line):
-            i += 1
+            num_lines = []
+            while i < n:
+                l = lines[i].rstrip("\n").rstrip("\r")
+                nm = NUMBERED_RE.match(l)
+                if not nm:
+                    break
+                num_lines.append(nm.group(2))
+                i += 1
+            for nline in num_lines:
+                p = doc.add_paragraph(style="List Number")
+                _add_inline_formatting(p, nline)
+                para_count += 1
             continue
 
         if CODE_FENCE_RE.match(line):
+            code_lines = []
             i += 1
+            while i < n and not CODE_FENCE_RE.match(lines[i]):
+                code_lines.append(lines[i].rstrip("\n").rstrip("\r"))
+                i += 1
+            i += 1
+            if code_lines:
+                text = "\n".join(code_lines)
+                p = doc.add_paragraph(style="Code Block")
+                run = p.add_run(text)
+                run.font.name = "Courier New"
+                run.font.size = Pt(9)
+                para_count += 1
             continue
 
         if BLOCKQUOTE_RE.match(line):
