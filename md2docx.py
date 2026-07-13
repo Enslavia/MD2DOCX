@@ -29,6 +29,23 @@ try:
 except ImportError:
     etree = None
 
+# Optional LaTeX→MathML→OMML conversion for equations
+try:
+    import latex2mathml.converter as _latex2mathml
+    HAS_LATEX2MATHML = True
+except ImportError:
+    _latex2mathml = None
+    HAS_LATEX2MATHML = False
+
+try:
+    import mathml2omml as _mathml2omml
+    HAS_MATHML2OMML = True
+except ImportError:
+    _mathml2omml = None
+    HAS_MATHML2OMML = False
+
+HAS_OMML = HAS_LATEX2MATHML and HAS_MATHML2OMML
+
 USE_GUI = False
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -46,8 +63,10 @@ EXISTING_NUM_RE = re.compile(r"^\d+(?:\.\d+)*\.?\s+")
 BULLET_RE = re.compile(r"^(\s*)[-*+]\s+(.*)$")
 NUMBERED_RE = re.compile(r"^(\s*)\d+\.\s+(.*)$")
 CODE_FENCE_RE = re.compile(r"^```(\w*)$")
+FORMULA_START_RE = re.compile(r"^\$\$\s*$")
+FORMULA_SINGLE_RE = re.compile(r"^\$\$(.*?)\$\$\s*$")
 BLOCKQUOTE_RE = re.compile(r"^>\s?(.*)$")
-TABLE_RE = re.compile(r"^\|.*\|$")
+TABLE_RE = re.compile(r"^.*\|.*\|.*$")
 HR_RE = re.compile(r"^([-*_])\s*\1\s*\1[\s\1]*$")
 
 INLINE_BOLD_ITALIC_RE = re.compile(r"\*\*\*(.+?)\*\*\*")
@@ -55,6 +74,9 @@ INLINE_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 INLINE_ITALIC_RE = re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)")
 INLINE_CODE_RE = re.compile(r"`([^`]+)`")
 INLINE_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+INLINE_FORMULA_RE = re.compile(r"(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)")  # $...$
+INLINE_DOLLAR_FORMULA_RE = re.compile(r"\$\$(.+?)\$\$")                  # $$...$$
+INLINE_SUPER_RE = re.compile(r"\^([^^\s()]+)")                          # ^text for superscript
 
 
 def _clear_theme_fonts(style):
@@ -92,6 +114,21 @@ def _set_run_font(run, name="Times New Roman", size=11, bold=False, italic=False
                     pass
 
 
+def _make_rpr_elem(ns_w, rPr_e=None):
+    if rPr_e is None:
+        rPr_e = etree.Element(f'{{{ns_w}}}rPr')
+    rFonts = rPr_e.find(f'{{{ns_w}}}rFonts')
+    if rFonts is None:
+        rFonts = etree.SubElement(rPr_e, f'{{{ns_w}}}rFonts')
+    for attr in ['asciiTheme', 'hAnsiTheme', 'cstheme', 'eastAsiaTheme']:
+        key = f'{{{ns_w}}}{attr}'
+        if key in rFonts.attrib:
+            del rFonts.attrib[key]
+    rFonts.set(f'{{{ns_w}}}ascii', 'Times New Roman')
+    rFonts.set(f'{{{ns_w}}}hAnsi', 'Times New Roman')
+    return rPr_e
+
+
 def _add_inline_formatting(paragraph, text):
     tokens = []
     pos = 0
@@ -101,6 +138,9 @@ def _add_inline_formatting(paragraph, text):
         i_m = INLINE_ITALIC_RE.search(text, pos)
         c_m = INLINE_CODE_RE.search(text, pos)
         l_m = INLINE_LINK_RE.search(text, pos)
+        f_m = INLINE_FORMULA_RE.search(text, pos)
+        df_m = INLINE_DOLLAR_FORMULA_RE.search(text, pos)
+        sp_m = INLINE_SUPER_RE.search(text, pos)
         matches = []
         if m:
             matches.append((m.start(), "bold_italic", m))
@@ -112,6 +152,12 @@ def _add_inline_formatting(paragraph, text):
             matches.append((c_m.start(), "code", c_m))
         if l_m:
             matches.append((l_m.start(), "link", l_m))
+        if f_m:
+            matches.append((f_m.start(), "formula", f_m))
+        if df_m:
+            matches.append((df_m.start(), "formula", df_m))
+        if sp_m:
+            matches.append((sp_m.start(), "super", sp_m))
 
         matches = [m for m in matches if m[0] >= pos]
         if not matches:
@@ -140,25 +186,56 @@ def _add_inline_formatting(paragraph, text):
         elif kind == "link":
             tokens.append(("link", match.group(1), match.group(2)))
             pos = match.end()
+        elif kind == "formula":
+            tokens.append(("formula", match.group(1)))
+            pos = match.end()
+        elif kind == "super":
+            tokens.append(("super", match.group(1)))
+            pos = match.end()
+
+    p_elem = paragraph._p
+    ns_w = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    ns_m = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
+
     for token in tokens:
-        if token[0] == "text":
-            run = paragraph.add_run(token[1])
-            _set_run_font(run)
-        elif token[0] == "bold_italic":
-            run = paragraph.add_run(token[1])
-            _set_run_font(run, bold=True, italic=True)
-        elif token[0] == "bold":
-            run = paragraph.add_run(token[1])
-            _set_run_font(run, bold=True)
-        elif token[0] == "italic":
-            run = paragraph.add_run(token[1])
-            _set_run_font(run, italic=True)
-        elif token[0] == "code":
-            run = paragraph.add_run(token[1])
-            _set_run_font(run, name="Courier New", size=10)
-        elif token[0] == "link":
-            run = paragraph.add_run(token[1])
-            _set_run_font(run, color=RGBColor(0x05, 0x63, 0xC1), underline=True)
+        if token[0] == "formula":
+            latex = token[1].strip()
+            omml_elem = _latex_to_omml_element(latex)
+            if omml_elem is not None:
+                if omml_elem.tag == f'{{{ns_w}}}r':
+                    p_elem.append(omml_elem)
+                else:
+                    oMathPara = etree.SubElement(p_elem, f'{{{ns_m}}}oMathPara')
+                    oMath_wrapper = etree.SubElement(oMathPara, f'{{{ns_m}}}oMath')
+                    for child in omml_elem:
+                        oMath_wrapper.append(child)
+                continue
+
+            run_elem = etree.SubElement(p_elem, f'{{{ns_w}}}r')
+            rPr = _make_rpr_elem(ns_w, etree.SubElement(run_elem, f'{{{ns_w}}}rPr'))
+            etree.SubElement(rPr, f'{{{ns_w}}}i').set(f'{{{ns_w}}}val', '1')
+            etree.SubElement(run_elem, f'{{{ns_w}}}t').text = latex
+        else:
+            run_elem = etree.SubElement(p_elem, f'{{{ns_w}}}r')
+            rPr_e = _make_rpr_elem(ns_w, etree.SubElement(run_elem, f'{{{ns_w}}}rPr'))
+            etree.SubElement(run_elem, f'{{{ns_w}}}t').text = token[1]
+            if token[0] == "bold_italic":
+                etree.SubElement(rPr_e, f'{{{ns_w}}}b')
+                etree.SubElement(rPr_e, f'{{{ns_w}}}i')
+            elif token[0] == "bold":
+                etree.SubElement(rPr_e, f'{{{ns_w}}}b')
+            elif token[0] == "italic":
+                etree.SubElement(rPr_e, f'{{{ns_w}}}i')
+            elif token[0] == "code":
+                rFonts = etree.SubElement(rPr_e, f'{{{ns_w}}}rFonts')
+                rFonts.set(f'{{{ns_w}}}ascii', 'Courier New')
+                rFonts.set(f'{{{ns_w}}}hAnsi', 'Courier New')
+                etree.SubElement(rPr_e, f'{{{ns_w}}}sz').set(f'{{{ns_w}}}val', '20')
+            elif token[0] == "link":
+                etree.SubElement(rPr_e, f'{{{ns_w}}}color').set(f'{{{ns_w}}}val', '0563C1')
+                etree.SubElement(rPr_e, f'{{{ns_w}}}u').set(f'{{{ns_w}}}val', 'single')
+            elif token[0] == "super":
+                etree.SubElement(rPr_e, f'{{{ns_w}}}vertAlign').set(f'{{{ns_w}}}val', 'superscript')
 
 
 def _configure_document(doc):
@@ -185,9 +262,16 @@ def _set_heading_font(style):
 
 
 def _apply_heading_fonts(doc):
+    heading_sizes = {1: 14, 2: 13, 3: 12}
     for i in range(1, 10):
         try:
-            _set_heading_font(doc.styles[f"Heading {i}"])
+            sty = doc.styles[f"Heading {i}"]
+            _set_heading_font(sty)
+            sty.font.bold = True
+            if i in heading_sizes:
+                sty.font.size = Pt(heading_sizes[i])
+            sty.paragraph_format.space_before = Pt(24 if i <= 2 else 18)
+            sty.paragraph_format.space_after = Pt(6)
         except KeyError:
             pass
     for sname in ["List Bullet", "List Number"]:
@@ -199,11 +283,106 @@ def _apply_heading_fonts(doc):
             pass
 
 
+def _latex_to_omml_paragraph(latex_text, doc):
+    """Convert a LaTeX math expression to an OMML equation paragraph."""
+    ns_m = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
+    ns_w = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+    if not HAS_OMML:
+        p = doc.add_paragraph()
+        run = p.add_run(latex_text)
+        run.font.italic = True
+        return p, False
+
+    try:
+        mathml = _latex2mathml.convert(latex_text)
+        omml_text = _mathml2omml.convert(mathml)
+    except Exception:
+        p = doc.add_paragraph()
+        run = p.add_run(latex_text)
+        run.font.italic = True
+        return p, False
+
+    import re
+    match = re.match(r'<m:oMath[^>]*>(.*)</m:oMath>', omml_text, re.DOTALL)
+    if not match:
+        p = doc.add_paragraph()
+        run = p.add_run(latex_text)
+        run.font.italic = True
+        return p, False
+
+    inner = match.group(1)
+    omml_xml = '<?xml version="1.0"?><m:oMath xmlns:m="%s">%s</m:oMath>' % (ns_m, inner)
+
+    try:
+        parser = etree.XMLParser(remove_blank_text=True)
+        omath = etree.fromstring(omml_xml, parser)
+    except Exception:
+        p = doc.add_paragraph()
+        run = p.add_run(latex_text)
+        run.font.italic = True
+        return p, False
+
+    # Start with a fresh paragraph from python-docx so it's tracked properly
+    p = doc.add_paragraph()
+    # Remove default run and inject OMML elements into the paragraph element
+    p_elem = p._p
+    # Clear all children (default run, etc.)
+    for child in list(p_elem):
+        p_elem.remove(child)
+
+    # Add pPr with center alignment
+    pPr = etree.SubElement(p_elem, '{%s}pPr' % ns_w)
+    jc = etree.SubElement(pPr, '{%s}jc' % ns_w)
+    jc.set('{%s}val' % ns_w, 'center')
+
+    # Add OMML structure
+    oMathPara = etree.SubElement(p_elem, '{%s}oMathPara' % ns_m)
+    oMath_wrapper = etree.SubElement(oMathPara, '{%s}oMath' % ns_m)
+
+    for child in omath:
+        oMath_wrapper.append(child)
+
+    return p_elem, True
+
+
+def _latex_to_omml_element(latex_text):
+    """Convert LaTeX to an OMML element, or None on failure."""
+    ns_m = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
+
+    if not HAS_OMML:
+        return None
+
+    try:
+        mathml = _latex2mathml.convert(latex_text)
+        omml_text = _mathml2omml.convert(mathml)
+    except Exception:
+        return None
+
+    import re
+    match = re.match(r'<m:oMath[^>]*>(.*)</m:oMath>', omml_text, re.DOTALL)
+    if not match:
+        return None
+
+    inner = match.group(1)
+    omml_xml = '<?xml version="1.0"?><m:oMath xmlns:m="%s">%s</m:oMath>' % (ns_m, inner)
+
+    try:
+        parser = etree.XMLParser(remove_blank_text=True)
+        return etree.fromstring(omml_xml, parser)
+    except Exception:
+        return None
+
+
 def parse_md_to_docx(md_path, docx_path):
     with open(md_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
 
-    doc = Document()
+    template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "template.docx")
+    if os.path.isfile(template_path):
+        doc = Document(template_path)
+    else:
+        doc = Document()
     _configure_document(doc)
     _apply_heading_fonts(doc)
 
@@ -288,7 +467,7 @@ def parse_md_to_docx(md_path, docx_path):
                 bullet_lines.append(bm.group(2))
                 i += 1
             for bline in bullet_lines:
-                p = doc.add_paragraph(style="List Bullet")
+                p = doc.add_paragraph(style="List Number")
                 _add_inline_formatting(p, bline)
                 para_count += 1
                 for pc_author, pc_text in pending_comments:
@@ -333,6 +512,37 @@ def parse_md_to_docx(md_path, docx_path):
                 pending_comments.clear()
             continue
 
+        if FORMULA_SINGLE_RE.match(line):
+            m = FORMULA_SINGLE_RE.match(line)
+            text = m.group(1).strip()
+            result, is_omml = _latex_to_omml_paragraph(text, doc)
+            if not is_omml:
+                result.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            para_count += 1
+            for pc_author, pc_text in pending_comments:
+                comment_list.append((para_count - 1, pc_author, pc_text))
+            pending_comments.clear()
+            i += 1
+            continue
+
+        if FORMULA_START_RE.match(line):
+            formula_lines = []
+            i += 1
+            while i < n and not FORMULA_START_RE.match(lines[i]):
+                formula_lines.append(lines[i].rstrip("\n").rstrip("\r"))
+                i += 1
+            i += 1
+            if formula_lines:
+                text = "\n".join(formula_lines)
+                result, is_omml = _latex_to_omml_paragraph(text, doc)
+                if not is_omml:
+                    result.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                para_count += 1
+                for pc_author, pc_text in pending_comments:
+                    comment_list.append((para_count - 1, pc_author, pc_text))
+                pending_comments.clear()
+            continue
+
         if BLOCKQUOTE_RE.match(line):
             bq_lines = []
             while i < n:
@@ -356,16 +566,18 @@ def parse_md_to_docx(md_path, docx_path):
                 pending_comments.clear()
             continue
 
-        if TABLE_RE.match(line) and line.count("|") >= 3:
-            sep_re = re.compile(r"^\|[\s\-:|+]+\|$")
+        if TABLE_RE.match(line) and line.count("|") >= 2:
+            sep_re = re.compile(r"^[\s\-:|+]+\|[\s\-:|+]+$")
             table_rows = []
             while i < n:
                 l = lines[i].rstrip("\n").rstrip("\r")
-                if TABLE_RE.match(l) and l.count("|") >= 3:
+                if TABLE_RE.match(l) and l.count("|") >= 2:
                     if sep_re.match(l):
                         i += 1
                         continue
-                    cells = [c.strip() for c in l.split("|")[1:-1]]
+                    cells = [c.strip() for c in l.split("|")]
+                    if l.startswith("|"):
+                        cells = cells[1:-1]
                     table_rows.append(cells)
                     i += 1
                 else:
@@ -451,15 +663,16 @@ def parse_md_to_docx(md_path, docx_path):
                 break
             if (HEADING_RE.match(l) or BULLET_RE.match(l) or NUMBERED_RE.match(l)
                     or CODE_FENCE_RE.match(l) or BLOCKQUOTE_RE.match(l)
-                    or (TABLE_RE.match(l) and l.count("|") >= 3)
-                    or HR_RE.match(l) or COMMENT_RE.match(l)):
+                    or (TABLE_RE.match(l) and l.count("|") >= 2)
+                    or HR_RE.match(l) or COMMENT_RE.match(l)
+                    or FORMULA_START_RE.match(l) or FORMULA_SINGLE_RE.match(l)):
                 break
             plain_lines.append(l)
             i += 1
 
         if plain_lines:
-            text = " ".join(plain_lines)
-            add_paragraph(text)
+            for pline in plain_lines:
+                add_paragraph(pline)
 
     _add_footer(doc)
 
@@ -1141,71 +1354,130 @@ def _do_inject_numbering(docx_path):
         max_num_id += 1
         return str(max_num_id)
 
-    # === BULLET NUMBERING ===
-    # Find existing bullet abstractNum
-    bullet_abs_id = None
-    for abs_num in num_root.iter(f"{{{ns}}}abstractNum"):
-        for lvl in abs_num.iter(f"{{{ns}}}lvl"):
-            nf = lvl.find(f"{{{ns}}}numFmt")
-            if nf is not None and nf.get(f"{{{ns}}}val") == "bullet":
-                bullet_abs_id = abs_num.get(f"{{{ns}}}abstractNumId")
+    # --- Bullet numbering injection ---
+    if True:
+        # Change ListBullet styleId to "a0" and basedOn to "a1" (Normal)
+        list_bullet_sid = "a0"
+        for style in styles_root.iter(f"{{{ns}}}style"):
+            name_el = style.find(f"{{{ns}}}name")
+            sname = name_el.get(f"{{{ns}}}val", "") if name_el is not None else ""
+            if sname == "List Bullet":
+                style.set(f"{{{ns}}}styleId", "a0")
+                based = style.find(f"{{{ns}}}basedOn")
+                if based is not None:
+                    based.set(f"{{{ns}}}val", "a1")
+                rPr = style.find(f"{{{ns}}}rPr")
+                if rPr is not None:
+                    lang = rPr.find(f"{{{ns}}}lang")
+                    if lang is None:
+                        lang = etree.SubElement(rPr, f"{{{ns}}}lang")
+                    lang.set(f"{{{ns}}}val", "ru-RU")
+                else:
+                    rPr_e = etree.SubElement(style, f"{{{ns}}}rPr")
+                    lang_e = etree.SubElement(rPr_e, f"{{{ns}}}lang")
+                    lang_e.set(f"{{{ns}}}val", "ru-RU")
+                for s2 in styles_root.iter(f"{{{ns}}}style"):
+                    sn2 = s2.find(f"{{{ns}}}name")
+                    if sn2 is not None and sn2.get(f"{{{ns}}}val") == "Normal" and s2.get(f"{{{ns}}}styleId") != "a1":
+                        s2.set(f"{{{ns}}}styleId", "a1")
                 break
-        if bullet_abs_id is not None:
-            break
 
-    if bullet_abs_id is None:
+        for abs_num in num_root.iter(f"{{{ns}}}abstractNum"):
+            for lvl in abs_num.iter(f"{{{ns}}}lvl"):
+                ps_el = lvl.find(f"{{{ns}}}pStyle")
+                if ps_el is not None:
+                    lvl.remove(ps_el)
+
+        w15_ns = "http://schemas.microsoft.com/office/word/2012/wordml"
+        w16cid_ns = "http://schemas.microsoft.com/office/word/2016/wordml/cid"
+
         bullet_abs_id = next_abs_id()
         b_abs = etree.SubElement(num_root, f"{{{ns}}}abstractNum")
         b_abs.set(f"{{{ns}}}abstractNumId", bullet_abs_id)
-        for lvl in range(9):
-            lvl_el = etree.SubElement(b_abs, f"{{{ns}}}lvl")
-            lvl_el.set(f"{{{ns}}}ilvl", str(lvl))
-            start_el = etree.SubElement(lvl_el, f"{{{ns}}}start")
-            start_el.set(f"{{{ns}}}val", "1")
-            nf_el = etree.SubElement(lvl_el, f"{{{ns}}}numFmt")
-            nf_el.set(f"{{{ns}}}val", "bullet")
-            lvl_text = etree.SubElement(lvl_el, f"{{{ns}}}lvlText")
-            lvl_text.set(f"{{{ns}}}val", "\u2022")
-            lvl_jc = etree.SubElement(lvl_el, f"{{{ns}}}lvlJc")
-            lvl_jc.set(f"{{{ns}}}val", "left")
+        b_abs.set(f"{{{w15_ns}}}restartNumberingAfterBreak", "0")
 
-    # Find existing bullet num
-    bullet_num_id = None
-    for num_el in num_root.iter(f"{{{ns}}}num"):
-        ref = num_el.find(f"{{{ns}}}abstractNumId")
-        if ref is not None and ref.get(f"{{{ns}}}val") == bullet_abs_id:
-            bullet_num_id = num_el.get(f"{{{ns}}}numId")
-            break
+        nsid = etree.SubElement(b_abs, f"{{{ns}}}nsid")
+        nsid.set(f"{{{ns}}}val", "%08X" % (int(bullet_abs_id) * 0x11111111 & 0xFFFFFFFF))
+        mt_el = etree.SubElement(b_abs, f"{{{ns}}}multiLevelType")
+        mt_el.set(f"{{{ns}}}val", "hybridMultilevel")
+        tmpl = etree.SubElement(b_abs, f"{{{ns}}}tmpl")
+        tmpl.set(f"{{{ns}}}val", "%08X" % (int(bullet_abs_id) * 0x22222222 & 0xFFFFFFFF))
 
-    if bullet_num_id is None:
+        lvl0 = etree.SubElement(b_abs, f"{{{ns}}}lvl")
+        lvl0.set(f"{{{ns}}}ilvl", "0")
+        lvl0.set(f"{{{ns}}}tplc", "E24889A4")
+        etree.SubElement(lvl0, f"{{{ns}}}start").set(f"{{{ns}}}val", "1")
+        etree.SubElement(lvl0, f"{{{ns}}}numFmt").set(f"{{{ns}}}val", "bullet")
+        etree.SubElement(lvl0, f"{{{ns}}}pStyle").set(f"{{{ns}}}val", "a0")
+        etree.SubElement(lvl0, f"{{{ns}}}lvlText").set(f"{{{ns}}}val", "\uF0B7")
+        etree.SubElement(lvl0, f"{{{ns}}}lvlJc").set(f"{{{ns}}}val", "left")
+        pp0 = etree.SubElement(lvl0, f"{{{ns}}}pPr")
+        etree.SubElement(pp0, f"{{{ns}}}ind").set(f"{{{ns}}}left", "360")
+        pp0.find(f"{{{ns}}}ind").set(f"{{{ns}}}hanging", "360")
+        rp0 = etree.SubElement(lvl0, f"{{{ns}}}rPr")
+        rf0 = etree.SubElement(rp0, f"{{{ns}}}rFonts")
+        rf0.set(f"{{{ns}}}ascii", "Symbol")
+        rf0.set(f"{{{ns}}}hAnsi", "Symbol")
+        rf0.set(f"{{{ns}}}hint", "default")
+
+        lvl_chars = [(360, "\uF0B7", "Symbol"),
+                     (1080, "o", "Courier New"),
+                     (1800, "\uF0A8", "Wingdings"),
+                     (2520, "\uF0B7", "Symbol"),
+                     (3240, "o", "Courier New"),
+                     (3960, "\uF0A8", "Wingdings"),
+                     (4680, "\uF0B7", "Symbol"),
+                     (5400, "o", "Courier New")]
+        for idx, (left, char, font) in enumerate(lvl_chars, 1):
+            le = etree.SubElement(b_abs, f"{{{ns}}}lvl")
+            le.set(f"{{{ns}}}ilvl", str(idx))
+            etree.SubElement(le, f"{{{ns}}}start").set(f"{{{ns}}}val", "1")
+            etree.SubElement(le, f"{{{ns}}}numFmt").set(f"{{{ns}}}val", "bullet")
+            etree.SubElement(le, f"{{{ns}}}lvlText").set(f"{{{ns}}}val", char)
+            etree.SubElement(le, f"{{{ns}}}lvlJc").set(f"{{{ns}}}val", "left")
+            pp = etree.SubElement(le, f"{{{ns}}}pPr")
+            ind = etree.SubElement(pp, f"{{{ns}}}ind")
+            ind.set(f"{{{ns}}}left", str(left))
+            ind.set(f"{{{ns}}}hanging", "360")
+            rp = etree.SubElement(le, f"{{{ns}}}rPr")
+            rf = etree.SubElement(rp, f"{{{ns}}}rFonts")
+            rf.set(f"{{{ns}}}ascii", font)
+            rf.set(f"{{{ns}}}hAnsi", font)
+            rf.set(f"{{{ns}}}hint", "default")
+
         bullet_num_id = next_num_id()
         b_num = etree.SubElement(num_root, f"{{{ns}}}num")
         b_num.set(f"{{{ns}}}numId", bullet_num_id)
-        ref = etree.SubElement(b_num, f"{{{ns}}}abstractNumId")
-        ref.set(f"{{{ns}}}val", bullet_abs_id)
+        ref_el = etree.SubElement(b_num, f"{{{ns}}}abstractNumId")
+        ref_el.set(f"{{{ns}}}val", bullet_abs_id)
 
-    # Modify ListBullet and ListParagraph styles to use bullet numbering
-    for style in styles_root.iter(f"{{{ns}}}style"):
-        sid = style.get(f"{{{ns}}}styleId")
-        if sid in ("ListBullet", "ListBullet2", "ListBullet3", "ListParagraph"):
-            pPr = style.find(f"{{{ns}}}pPr")
+        for style in styles_root.iter(f"{{{ns}}}style"):
+            name_el = style.find(f"{{{ns}}}name")
+            sn = name_el.get(f"{{{ns}}}val", "") if name_el is not None else ""
+            if sn == "List Bullet":
+                spPr = style.find(f"{{{ns}}}pPr")
+                if spPr is None:
+                    spPr = etree.SubElement(style, f"{{{ns}}}pPr")
+                    style.append(spPr)
+                for enp in list(spPr.findall(f"{{{ns}}}numPr")):
+                    spPr.remove(enp)
+                snp = etree.SubElement(spPr, f"{{{ns}}}numPr")
+                spPr.append(snp)
+                snid = etree.SubElement(snp, f"{{{ns}}}numId")
+                snp.append(snid)
+                snid.set(f"{{{ns}}}val", bullet_num_id)
+                break
+
+        for p in list(body.iter(f"{{{ns}}}p")):
+            pPr = p.find(f"{{{ns}}}pPr")
             if pPr is None:
-                pPr = etree.SubElement(style, f"{{{ns}}}pPr")
-                style.append(pPr)
-            numPr = pPr.find(f"{{{ns}}}numPr")
-            if numPr is None:
-                numPr = etree.SubElement(pPr, f"{{{ns}}}numPr")
-                pPr.append(numPr)
-            numId_el = numPr.find(f"{{{ns}}}numId")
-            if numId_el is None:
-                numId_el = etree.SubElement(numPr, f"{{{ns}}}numId")
-                numPr.append(numId_el)
-            numId_el.set(f"{{{ns}}}val", bullet_num_id)
-            ilvl_el = numPr.find(f"{{{ns}}}ilvl")
-            if ilvl_el is None:
-                ilvl_el = etree.SubElement(numPr, f"{{{ns}}}ilvl")
-                numPr.append(ilvl_el)
-            ilvl_el.set(f"{{{ns}}}val", "0")
+                continue
+            pStyle = pPr.find(f"{{{ns}}}pStyle")
+            if pStyle is None:
+                continue
+            old_val = pStyle.get(f"{{{ns}}}val")
+            if old_val == "ListBullet":
+                pStyle.set(f"{{{ns}}}val", "a0")
 
     # === HEADING AUTO-NUMBERING ===
     heading_abs_id = next_abs_id()
