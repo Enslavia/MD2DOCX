@@ -169,6 +169,35 @@ def _configure_document(doc):
     pf.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
     _clear_theme_fonts(style)
 
+    _create_style(doc, "Code Block", "Normal")
+    _create_style(doc, "Document Title", "Normal")
+
+
+def _create_style(doc, name, base_style):
+    style = doc.styles.add_style(name, 1)
+    style.base_style = doc.styles[base_style]
+    return style
+
+
+def _set_heading_font(style):
+    style.font.name = "Times New Roman"
+    _clear_theme_fonts(style)
+
+
+def _apply_heading_fonts(doc):
+    for i in range(1, 10):
+        try:
+            _set_heading_font(doc.styles[f"Heading {i}"])
+        except KeyError:
+            pass
+    for sname in ["List Bullet", "List Number"]:
+        try:
+            sty = doc.styles[sname]
+            sty.font.name = "Times New Roman"
+            _clear_theme_fonts(sty)
+        except KeyError:
+            pass
+
 
 def parse_md_to_docx(md_path, docx_path):
     with open(md_path, "r", encoding="utf-8") as f:
@@ -176,11 +205,26 @@ def parse_md_to_docx(md_path, docx_path):
 
     doc = Document()
     _configure_document(doc)
+    _apply_heading_fonts(doc)
+
+    title_style = doc.styles["Document Title"]
+    title_style.font.name = "Times New Roman"
+    title_style.font.size = Pt(20)
+    title_style.font.bold = True
+    title_style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title_style.paragraph_format.space_after = Pt(24)
+    _clear_theme_fonts(title_style)
+
+    code_style = doc.styles["Code Block"]
+    code_style.font.name = "Courier New"
+    code_style.font.size = Pt(9)
+    code_style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
     i = 0
     n = len(lines)
     pending_comments = []
     para_count = 0
+    title_done = False
 
     def add_paragraph(text, style=None):
         nonlocal para_count
@@ -200,13 +244,29 @@ def parse_md_to_docx(md_path, docx_path):
     while i < n:
         raw = lines[i]
         line = raw.rstrip("\n").rstrip("\r")
+
         cm = COMMENT_RE.match(line)
         if cm:
             pending_comments.append((cm.group(1), cm.group(2)))
             i += 1
             continue
 
-        if HEADING_RE.match(line):
+        hm = HEADING_RE.match(line)
+        if hm:
+            level = len(hm.group(1))
+            text = hm.group(2)
+            text = EXISTING_NUM_RE.sub("", text, count=1)
+            if not title_done and level == 1:
+                p = doc.add_paragraph(style="Document Title")
+                _add_inline_formatting(p, text)
+                para_count += 1
+                title_done = True
+            else:
+                eff_level = level - 1 if title_done else level
+                eff_level = max(1, min(eff_level, 9))
+                p = doc.add_paragraph(style=f"Heading {eff_level}")
+                _add_inline_formatting(p, text)
+                para_count += 1
             i += 1
             continue
 
@@ -220,17 +280,83 @@ def parse_md_to_docx(md_path, docx_path):
 
         if CODE_FENCE_RE.match(line):
             i += 1
-            while i < n and not CODE_FENCE_RE.match(lines[i]):
-                i += 1
-            i += 1
             continue
 
         if BLOCKQUOTE_RE.match(line):
-            i += 1
+            bq_lines = []
+            while i < n:
+                l = lines[i].rstrip("\n").rstrip("\r")
+                bqm = BLOCKQUOTE_RE.match(l)
+                if not bqm:
+                    break
+                bq_lines.append(bqm.group(1))
+                i += 1
+            if bq_lines:
+                text = " ".join(bq_lines)
+                p = doc.add_paragraph()
+                _add_inline_formatting(p, text)
+                for run in p.runs:
+                    run.font.italic = True
+                    run.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
+                p.paragraph_format.left_indent = Inches(0.5)
+                para_count += 1
             continue
 
         if TABLE_RE.match(line) and line.count("|") >= 3:
-            i += 1
+            sep_re = re.compile(r"^\|[\s\-:|+]+\|$")
+            table_rows = []
+            while i < n:
+                l = lines[i].rstrip("\n").rstrip("\r")
+                if TABLE_RE.match(l) and l.count("|") >= 3:
+                    if sep_re.match(l):
+                        i += 1
+                        continue
+                    cells = [c.strip() for c in l.split("|")[1:-1]]
+                    table_rows.append(cells)
+                    i += 1
+                else:
+                    break
+            if len(table_rows) >= 2:
+                num_cols = max(len(r) for r in table_rows)
+                tbl = doc.add_table(rows=len(table_rows), cols=num_cols)
+                tbl.style = "Table Grid"
+                tbl.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                tbl.autofit = True
+                tbl.columns[0].width = None
+                tbl_element = tbl._tbl
+                tblPr = tbl_element.find(qn("w:tblPr"))
+                if tblPr is None:
+                    tblPr = parse_xml(f'<w:tblPr {nsdecls("w")}></w:tblPr>')
+                    tbl_element.insert(0, tblPr)
+                tblW = tblPr.find(qn("w:tblW"))
+                if tblW is None:
+                    tblW = parse_xml(f'<w:tblW {nsdecls("w")} w:w="5000" w:type="pct"/>')
+                    tblPr.append(tblW)
+                else:
+                    tblW.set(qn("w:w"), "5000")
+                    tblW.set(qn("w:type"), "pct")
+                for row_idx, row_data in enumerate(table_rows):
+                    for col_idx in range(num_cols):
+                        cell = tbl.cell(row_idx, col_idx)
+                        cell.text = ""
+                        val = row_data[col_idx] if col_idx < len(row_data) else ""
+                        p = cell.paragraphs[0]
+                        _add_inline_formatting(p, val)
+                        if row_idx == 0:
+                            for run in p.runs:
+                                run.font.bold = True
+                tr_elements = tbl_element.findall(qn("w:tr"))
+                if len(tr_elements) > 0:
+                    first_tr = tr_elements[0]
+                    trPr = first_tr.find(qn("w:trPr"))
+                    if trPr is None:
+                        trPr = parse_xml(f'<w:trPr {nsdecls("w")}></w:trPr>')
+                        first_tr.insert(0, trPr)
+                    tblHeader = trPr.find(qn("w:tblHeader"))
+                    if tblHeader is None:
+                        tblHeader = parse_xml(f'<w:tblHeader {nsdecls("w")}/>')
+                        trPr.append(tblHeader)
+                para_count += 1
             continue
 
         if HR_RE.match(line):
@@ -239,6 +365,18 @@ def parse_md_to_docx(md_path, docx_path):
                 if HEADING_RE.match(next_line):
                     i += 1
                     continue
+            p = doc.add_paragraph()
+            pPr = p._element.find(qn("w:pPr"))
+            if pPr is None:
+                pPr = parse_xml(f'<w:pPr {nsdecls("w")}></w:pPr>')
+                p._element.insert(0, pPr)
+            pBdr = parse_xml(
+                f'<w:pBdr {nsdecls("w")}>'
+                f'<w:bottom w:val="single" w:sz="6" w:space="1" w:color="auto"/>'
+                f'</w:pBdr>'
+            )
+            pPr.append(pBdr)
+            para_count += 1
             i += 1
             continue
 
