@@ -435,10 +435,48 @@ def parse_md_to_docx(md_path, docx_path):
             text = " ".join(plain_lines)
             add_paragraph(text)
 
+    _add_footer(doc)
+
     buf = io.BytesIO()
     doc.save(buf)
     with open(docx_path, "wb") as f:
         f.write(buf.getvalue())
+
+
+def _add_footer(doc):
+    class CustomFooterPart(docx.parts.hdrftr.FooterPart):
+        @classmethod
+        def _default_footer_xml(cls):
+            return (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+                ' xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">'
+                '<w:p><w:pPr><w:jc w:val="center"/></w:pPr>'
+                '<w:r><w:fldChar w:fldCharType="begin"/></w:r>'
+                '<w:r><w:instrText> PAGE </w:instrText></w:r>'
+                '<w:r><w:fldChar w:fldCharType="separate"/></w:r>'
+                '<w:r><w:t>1</w:t></w:r>'
+                '<w:r><w:fldChar w:fldCharType="end"/></w:r>'
+                '</w:p></w:ftr>'
+            )
+
+    docx.parts.hdrftr.FooterPart = CustomFooterPart
+
+    section = doc.sections[0]
+    footer = section.footer
+    footer.is_linked_to_previous = False
+    footer_para = footer.paragraphs[0]
+    footer_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    footer_para.clear()
+    run = footer_para.add_run()
+    run._element.append(parse_xml(f'<w:fldChar {nsdecls("w")} w:fldCharType="begin"/>'))
+    run2 = footer_para.add_run()
+    run2._element.append(parse_xml(f'<w:instrText {nsdecls("w")} xml:space="preserve"> PAGE </w:instrText>'))
+    run3 = footer_para.add_run()
+    run3._element.append(parse_xml(f'<w:fldChar {nsdecls("w")} w:fldCharType="separate"/>'))
+    run4 = footer_para.add_run("1")
+    run5 = footer_para.add_run()
+    run5._element.append(parse_xml(f'<w:fldChar {nsdecls("w")} w:fldCharType="end"/>'))
 
 
 def parse_docx_to_md(docx_path, md_path):
