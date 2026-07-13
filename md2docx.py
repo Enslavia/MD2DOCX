@@ -1072,7 +1072,282 @@ def _inject_comments(buf, out_path, comments):
 
 
 def _inject_numbering(docx_path):
-    pass
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    r_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+    with zipfile.ZipFile(docx_path, "r") as z:
+        data = {n: z.read(n) for n in z.namelist()}
+
+    doc_root = etree.fromstring(data["word/document.xml"])
+    body = doc_root.find(f"{{{ns}}}body")
+
+    styles_root = etree.fromstring(data["word/styles.xml"])
+
+    has_numbering = "word/numbering.xml" in data
+    if has_numbering:
+        num_root = etree.fromstring(data["word/numbering.xml"])
+    else:
+        num_root = etree.fromstring(
+            f'<w:numbering xmlns:w="{ns}" xmlns:r="{r_ns}"></w:numbering>'
+        )
+
+    # Find max existing IDs
+    max_abs_id = -1
+    max_num_id = -1
+    for abs_num in num_root.iter(f"{{{ns}}}abstractNum"):
+        aid = abs_num.get(f"{{{ns}}}abstractNumId")
+        if aid is not None:
+            try:
+                max_abs_id = max(max_abs_id, int(aid))
+            except ValueError:
+                pass
+    for num_el in num_root.iter(f"{{{ns}}}num"):
+        nid = num_el.get(f"{{{ns}}}numId")
+        if nid is not None:
+            try:
+                max_num_id = max(max_num_id, int(nid))
+            except ValueError:
+                pass
+
+    def next_abs_id():
+        nonlocal max_abs_id
+        max_abs_id += 1
+        return str(max_abs_id)
+
+    def next_num_id():
+        nonlocal max_num_id
+        max_num_id += 1
+        return str(max_num_id)
+
+    # === BULLET NUMBERING ===
+    # Find existing bullet abstractNum
+    bullet_abs_id = None
+    for abs_num in num_root.iter(f"{{{ns}}}abstractNum"):
+        for lvl in abs_num.iter(f"{{{ns}}}lvl"):
+            nf = lvl.find(f"{{{ns}}}numFmt")
+            if nf is not None and nf.get(f"{{{ns}}}val") == "bullet":
+                bullet_abs_id = abs_num.get(f"{{{ns}}}abstractNumId")
+                break
+        if bullet_abs_id is not None:
+            break
+
+    if bullet_abs_id is None:
+        bullet_abs_id = next_abs_id()
+        b_abs = etree.SubElement(num_root, f"{{{ns}}}abstractNum")
+        b_abs.set(f"{{{ns}}}abstractNumId", bullet_abs_id)
+        for lvl in range(9):
+            lvl_el = etree.SubElement(b_abs, f"{{{ns}}}lvl")
+            lvl_el.set(f"{{{ns}}}ilvl", str(lvl))
+            start_el = etree.SubElement(lvl_el, f"{{{ns}}}start")
+            start_el.set(f"{{{ns}}}val", "1")
+            nf_el = etree.SubElement(lvl_el, f"{{{ns}}}numFmt")
+            nf_el.set(f"{{{ns}}}val", "bullet")
+            lvl_text = etree.SubElement(lvl_el, f"{{{ns}}}lvlText")
+            lvl_text.set(f"{{{ns}}}val", "\u2022")
+            lvl_jc = etree.SubElement(lvl_el, f"{{{ns}}}lvlJc")
+            lvl_jc.set(f"{{{ns}}}val", "left")
+
+    # Find existing bullet num
+    bullet_num_id = None
+    for num_el in num_root.iter(f"{{{ns}}}num"):
+        ref = num_el.find(f"{{{ns}}}abstractNumId")
+        if ref is not None and ref.get(f"{{{ns}}}val") == bullet_abs_id:
+            bullet_num_id = num_el.get(f"{{{ns}}}numId")
+            break
+
+    if bullet_num_id is None:
+        bullet_num_id = next_num_id()
+        b_num = etree.SubElement(num_root, f"{{{ns}}}num")
+        b_num.set(f"{{{ns}}}numId", bullet_num_id)
+        ref = etree.SubElement(b_num, f"{{{ns}}}abstractNumId")
+        ref.set(f"{{{ns}}}val", bullet_abs_id)
+
+    # Modify ListBullet and ListParagraph styles to use bullet numbering
+    for style in styles_root.iter(f"{{{ns}}}style"):
+        sid = style.get(f"{{{ns}}}styleId")
+        if sid in ("ListBullet", "ListBullet2", "ListBullet3", "ListParagraph"):
+            pPr = style.find(f"{{{ns}}}pPr")
+            if pPr is None:
+                pPr = etree.SubElement(style, f"{{{ns}}}pPr")
+                style.append(pPr)
+            numPr = pPr.find(f"{{{ns}}}numPr")
+            if numPr is None:
+                numPr = etree.SubElement(pPr, f"{{{ns}}}numPr")
+                pPr.append(numPr)
+            numId_el = numPr.find(f"{{{ns}}}numId")
+            if numId_el is None:
+                numId_el = etree.SubElement(numPr, f"{{{ns}}}numId")
+                numPr.append(numId_el)
+            numId_el.set(f"{{{ns}}}val", bullet_num_id)
+            ilvl_el = numPr.find(f"{{{ns}}}ilvl")
+            if ilvl_el is None:
+                ilvl_el = etree.SubElement(numPr, f"{{{ns}}}ilvl")
+                numPr.append(ilvl_el)
+            ilvl_el.set(f"{{{ns}}}val", "0")
+
+    # === HEADING AUTO-NUMBERING ===
+    heading_abs_id = next_abs_id()
+    h_abs = etree.SubElement(num_root, f"{{{ns}}}abstractNum")
+    h_abs.set(f"{{{ns}}}abstractNumId", heading_abs_id)
+    multiLevel_type = etree.SubElement(h_abs, f"{{{ns}}}multiLevelType")
+    multiLevel_type.set(f"{{{ns}}}val", "hybridMultilevel")
+    for lvl in range(9):
+        lvl_el = etree.SubElement(h_abs, f"{{{ns}}}lvl")
+        lvl_el.set(f"{{{ns}}}ilvl", str(lvl))
+        start_el = etree.SubElement(lvl_el, f"{{{ns}}}start")
+        start_el.set(f"{{{ns}}}val", "1")
+        nf_el = etree.SubElement(lvl_el, f"{{{ns}}}numFmt")
+        nf_el.set(f"{{{ns}}}val", "decimal")
+        level_text_parts = [f"%{i+1}." for i in range(lvl + 1)]
+        lvl_text = etree.SubElement(lvl_el, f"{{{ns}}}lvlText")
+        lvl_text.set(f"{{{ns}}}val", "".join(level_text_parts))
+        lvl_jc = etree.SubElement(lvl_el, f"{{{ns}}}lvlJc")
+        lvl_jc.set(f"{{{ns}}}val", "left")
+
+    heading_num_id = next_num_id()
+    h_num = etree.SubElement(num_root, f"{{{ns}}}num")
+    h_num.set(f"{{{ns}}}numId", heading_num_id)
+    ref = etree.SubElement(h_num, f"{{{ns}}}abstractNumId")
+    ref.set(f"{{{ns}}}val", heading_abs_id)
+
+    # Assign heading numbering to Heading 1-9 styles
+    for i in range(1, 10):
+        style_id = f"Heading{i}"
+        for style in styles_root.iter(f"{{{ns}}}style"):
+            sid = style.get(f"{{{ns}}}styleId")
+            if sid == style_id:
+                pPr = style.find(f"{{{ns}}}pPr")
+                if pPr is None:
+                    pPr = etree.SubElement(style, f"{{{ns}}}pPr")
+                    style.append(pPr)
+                numPr = pPr.find(f"{{{ns}}}numPr")
+                if numPr is None:
+                    numPr = etree.SubElement(pPr, f"{{{ns}}}numPr")
+                    pPr.append(numPr)
+                numId_el = numPr.find(f"{{{ns}}}numId")
+                if numId_el is None:
+                    numId_el = etree.SubElement(numPr, f"{{{ns}}}numId")
+                    numPr.append(numId_el)
+                numId_el.set(f"{{{ns}}}val", heading_num_id)
+                ilvl_el = numPr.find(f"{{{ns}}}ilvl")
+                if ilvl_el is None:
+                    ilvl_el = etree.SubElement(numPr, f"{{{ns}}}ilvl")
+                    numPr.append(ilvl_el)
+                ilvl_el.set(f"{{{ns}}}val", str(i - 1))
+                break
+
+    # === PER-GROUP NUMBERED LIST RESTART ===
+    # Find list number numId from style
+    list_num_style_id = None
+    for style in styles_root.iter(f"{{{ns}}}style"):
+        sid = style.get(f"{{{ns}}}styleId")
+        if sid == "ListNumber":
+            pPr = style.find(f"{{{ns}}}pPr")
+            if pPr is not None:
+                numPr = pPr.find(f"{{{ns}}}numPr")
+                if numPr is not None:
+                    nid_el = numPr.find(f"{{{ns}}}numId")
+                    if nid_el is not None:
+                        list_num_style_id = nid_el.get(f"{{{ns}}}val")
+            break
+
+    # Scan body for consecutive ListNumber paragraphs
+    paragraphs = []
+    for child in body:
+        if child.tag == f"{{{ns}}}p":
+            paragraphs.append(child)
+        # Skip tables
+
+    list_groups = []
+    current_group = None
+    for p in paragraphs:
+        pPr = p.find(f"{{{ns}}}pPr")
+        style_id_in_p = None
+        if pPr is not None:
+            pStyle = pPr.find(f"{{{ns}}}pStyle")
+            if pStyle is not None:
+                style_id_in_p = pStyle.get(f"{{{ns}}}val")
+        if style_id_in_p == "ListNumber":
+            if current_group is None:
+                current_group = []
+                list_groups.append(current_group)
+            current_group.append(p)
+        else:
+            current_group = None
+
+    for group in list_groups:
+        g_num_id = next_num_id()
+        g_num = etree.SubElement(num_root, f"{{{ns}}}num")
+        g_num.set(f"{{{ns}}}numId", g_num_id)
+        # Reference the same abstractNum as ListNumber
+        if list_num_style_id:
+            # Find the num that ListNumber style references
+            ref_abs = None
+            for num_el in num_root.iter(f"{{{ns}}}num"):
+                nid = num_el.get(f"{{{ns}}}numId")
+                if nid == list_num_style_id:
+                    ref_abs_el = num_el.find(f"{{{ns}}}abstractNumId")
+                    if ref_abs_el is not None:
+                        ref_abs = ref_abs_el.get(f"{{{ns}}}val")
+                    break
+            if ref_abs is None:
+                # Create a new abstractNum for list numbering
+                list_abs_id = next_abs_id()
+                l_abs = etree.SubElement(num_root, f"{{{ns}}}abstractNum")
+                l_abs.set(f"{{{ns}}}abstractNumId", list_abs_id)
+                for lvl in range(9):
+                    lvl_el = etree.SubElement(l_abs, f"{{{ns}}}lvl")
+                    lvl_el.set(f"{{{ns}}}ilvl", str(lvl))
+                    start_el = etree.SubElement(lvl_el, f"{{{ns}}}start")
+                    start_el.set(f"{{{ns}}}val", "1")
+                    nf_el = etree.SubElement(lvl_el, f"{{{ns}}}numFmt")
+                    nf_el.set(f"{{{ns}}}val", "decimal")
+                    lvl_text = etree.SubElement(lvl_el, f"{{{ns}}}lvlText")
+                    lvl_text.set(f"{{{ns}}}val", f"%{lvl+1}.")
+                    lvl_jc = etree.SubElement(lvl_el, f"{{{ns}}}lvlJc")
+                    lvl_jc.set(f"{{{ns}}}val", "left")
+                ref_abs = list_abs_id
+            ref = etree.SubElement(g_num, f"{{{ns}}}abstractNumId")
+            ref.set(f"{{{ns}}}val", ref_abs)
+        else:
+            # Use the heading abstract num as fallback
+            ref = etree.SubElement(g_num, f"{{{ns}}}abstractNumId")
+            ref.set(f"{{{ns}}}val", heading_abs_id)
+
+        # Add startOverride
+        lvlOverride = etree.SubElement(g_num, f"{{{ns}}}lvlOverride")
+        lvlOverride.set(f"{{{ns}}}ilvl", "0")
+        startOverride = etree.SubElement(lvlOverride, f"{{{ns}}}startOverride")
+        startOverride.set(f"{{{ns}}}val", "1")
+
+        for p in group:
+            pPr = p.find(f"{{{ns}}}pPr")
+            if pPr is None:
+                pPr = etree.Element(f"{{{ns}}}pPr")
+                p.insert(0, pPr)
+            # Remove existing numPr
+            existing_numPr = pPr.find(f"{{{ns}}}numPr")
+            if existing_numPr is not None:
+                pPr.remove(existing_numPr)
+            # Remove pStyle
+            existing_pStyle = pPr.find(f"{{{ns}}}pStyle")
+            if existing_pStyle is not None:
+                pPr.remove(existing_pStyle)
+
+            new_numPr = etree.SubElement(pPr, f"{{{ns}}}numPr")
+            new_ilvl = etree.SubElement(new_numPr, f"{{{ns}}}ilvl")
+            new_ilvl.set(f"{{{ns}}}val", "0")
+            new_numId = etree.SubElement(new_numPr, f"{{{ns}}}numId")
+            new_numId.set(f"{{{ns}}}val", g_num_id)
+            pPr.append(new_numPr)
+
+    data["word/document.xml"] = etree.tostring(doc_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    data["word/styles.xml"] = etree.tostring(styles_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    data["word/numbering.xml"] = etree.tostring(num_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+    with zipfile.ZipFile(docx_path, "w") as zout:
+        for name, content in data.items():
+            zout.writestr(name, content)
 
 
 def main():
