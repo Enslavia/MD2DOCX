@@ -6,3 +6,8 @@ build/
 dist/
 *.spec
 md2docx_debug.log
+
+test/
+test_copy.*
+*.docx
+
